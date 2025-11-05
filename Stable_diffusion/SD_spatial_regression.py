@@ -1,10 +1,20 @@
 
 """
-Script de fine_tuning de Stable_diffusion avec les adaptaters de la méthode LoRA de HuggingFace
+Script de fine_tuning de Stable_diffusion avec les adaptaters de la méthode LoRA de HuggingFace.
 
-Pour fine_tuner Stable_diffusion on utilisera la lib diffusers qui gère la mécanique de training LoRA
+Pour fine_tuner Stable_diffusion on utilisera la lib diffusers qui gère la mécanique de training LoRA.
+
+Dans ce script on modifira le rôle de debruiteur de l'UNet pour l'adapter à une fonction de regression spatiale :
+
+Workflow du pipeline :
+1- encodage de l'image d'entrée avec le VAE => latent_inp
+2- encodage de l'image cible avec le VAE => latent_tar
+3- génération d'un latent de prediction avec l'UNet => latent_pred
+4- calcul de la loss : MAE(latent_pred, latent_tar)
+5- generation de l'image predite : VAE.decode(latent_pred)
 
 
+Workflow du script :
 1- Import des librairies
 2- loading du modèle pré-entrainé Stable_diffusion v1-5 avec le Pipeline de diffusers
 3- loading et processing du dataset
@@ -16,9 +26,9 @@ Pour fine_tuner Stable_diffusion on utilisera la lib diffusers qui gère la méc
 
 
 
-# ////////////////////////
+# //////////////////////////////////////////////////////////
 # 1- Import des librairies
-# ////////////////////////
+# //////////////////////////////////////////////////////////
 
 import torch
 from pathlib import Path
@@ -28,18 +38,13 @@ from PIL import Image
 import os
 import numpy as np
 from tqdm import tqdm
-import torchvision.transforms as transforms
 from peft import get_peft_model, LoraConfig, TaskType
 import torch.nn.functional as F
-from torchvision import transforms
 import csv
-from sklearn.model_selection import train_test_split
 import random
 from itertools import product
-import copy
 import matplotlib.pyplot as plt
 import json
-from stable_dataset import generate_dataset
 
 DEBUG = False
 
@@ -47,52 +52,13 @@ DEBUG = False
 # check l'accès aux GPUs
 torch.cuda.is_available()
 
-#/////////////////////////////////////
-# 2- création du dataset
-#/////////////////////////////////////
+#////////////////////////////////////////////////////////////
+# 2- définition du dataset 
+#////////////////////////////////////////////////////////////
 
-metadata_path = generate_dataset(
-    dataset_path=Path("./git/ImageMLProject/Datasets/CFD_Dataset/film_3_512x512.npy"),
-    data_dir="./git/ImageMLProject/Stable_diffusion/dataset_velocity",
-    use_prompt=True,
-    resize_shape=(512,512)
-)
+# on repart du même dataset 
 
-
-# ////////////////////////////////////
-# 2- Loading et processing du dataset
-# ////////////////////////////////////
-
-"""
-Objectif :
-1- création des couples inp/tar
-2- mélange des couples
-3- split du dataset en train/val/test
-4- création des tensors PyTorch [C,H,W] normalisés entre [0,1]
-5- création des dataloaders nécessaires pour LoRA
-
-"""
-"""
-
-input_dir = os.path.join(DATA_DIR, "input")
-target_dir = os.path.join(DATA_DIR, "target")
-all_files = sorted(os.listdir(input_dir))
-
-# shuffle des couples
-random.seed(42)
-random.shuffle(all_files)
-
-
-# split du dataset en train/val/test 80%/10%/10%
-train_files, tmp_files = train_test_split(all_files, test_size=0.2, random_state=42)
-val_files, test_files = train_test_split(tmp_files, test_size=0.5, random_state=42)
-
-print(f"Train: {len(train_files)} | Val: {len(val_files)} | Test: {len(test_files)}")
-
-output_dir = Path("./LoRA_results")
-os.makedirs(output_dir, exist_ok=True)
-"""
-
+DATA_DIR = os.path.join("./git/ImageMLProject/Stable_diffusion/dataset_velocity")
 
 class VelocityDataset (Dataset):
     def __init__(self, data_dir, metadata_path=None):
@@ -126,78 +92,39 @@ class VelocityDataset (Dataset):
         return inp_tensor, tar_tensor, caption
 
 
-"""
-possiblité d'utiliser torchvision.transforms :
-
-# ToTensor() :
-# 1- conversion PIL.Image -> torch.Tensor
-# 2- permute les canaux
-# 3- normalise les valeurs entre 0 et 1
-
-transform = transforms.Compose([
-    transforms.ConvertImageDtype(torch.float32),
-    transforms.ToTensor(),  # convertit automatiquement en C,H,W et normalise entre 0–1
-])
-
-inp = transform(Image.open(inp_path).convert("RGB"))
-tgt = transform(Image.open(tgt_path).convert("RGB"))
-
-"""
-
-
-
-BATCH_SIZE = 1
-DATA_DIR = os.path.join("./git/ImageMLProject/Stable_diffusion/dataset_velocity")
-
-
-
-# récupération des données
-with open(metadata_path, "r") as f:
-    metadata = [json.loads(line) for line in f]
-
-# shuffle des couples
-random.seed(42)
-random.shuffle(metadata)
-
-# split du dataset en train/val/test
-train_files, tmp_files = train_test_split(metadata, test_size=0.2, random_state=42)
-val_files, test_files = train_test_split(tmp_files, test_size=0.5, random_state=42)
-
-# sauvegarde des datasets
-def save_jsonl(meta_list, save_path):
-    with open(save_path, "w") as f:
-        for entry in meta_list:
-            f.write(json.dumps(entry))
-            f.write("\n")
-
-save_jsonl(train_files, os.path.join(DATA_DIR, "train_metadata.jsonl"))
-save_jsonl(val_files, os.path.join(DATA_DIR, "val_metadata.jsonl"))
-save_jsonl(test_files, os.path.join(DATA_DIR, "test_metadata.jsonl"))
 
 
 # loading des datasets
+
 train_dataset = VelocityDataset(DATA_DIR, metadata_path=os.path.join(DATA_DIR, "train_metadata.jsonl"))
 val_dataset = VelocityDataset(DATA_DIR, metadata_path=os.path.join(DATA_DIR, "val_metadata.jsonl"))
 test_dataset = VelocityDataset(DATA_DIR, metadata_path=os.path.join(DATA_DIR, "test_metadata.jsonl"))
 
 if DEBUG :
     for i in range(5):  # les 5 premiers éléments
-        inp, tar, caption = train_dataset[i]
+        inp, tar = train_dataset[i]
         print(f"Sample {i}:")
         print(f"  Input tensor shape : {inp.shape}, dtype={inp.dtype}, min={np.min(inp.numpy())}, max={np.max(inp.numpy())}")
         print(f"  Target tensor shape: {tar.shape}, dtype={tar.dtype}")
         # torch.Tensor float32 [3,512,512] [0,1]
-        print(f"  Caption  : '{caption}'")
 
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True) # torch.Tensor float32 [1,3,512,512]
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+# génération des DataLoaders avec différents batch_size
+
+
+def make_dataloaders (train_dataset, val_dataset, test_dataset, batch_size=1):
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True) # torch.Tensor float32 [1,3,512,512]
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader
+
+
 
 
 if DEBUG:
-    inp, tar, caption = next(iter(train_loader))
-    print(inp.shape, inp.dtype, type(inp), np.min(inp.numpy()), np.max(inp.numpy()), f"caption : {caption}")
+    train_loader, val_loader, test_loader = make_dataloaders(train_dataset, val_dataset, test_dataset)
+    inp, tar = next(iter(train_loader))
+    print(inp.shape, inp.dtype, type(inp), np.min(inp.numpy()), np.max(inp.numpy()))
     # torch.Tensor float32 [1,3,512,512] [0,1]
     import matplotlib.pyplot as plt
     plt.subplot(1, 2, 1)
@@ -210,9 +137,9 @@ if DEBUG:
 
 
 
-# //////////////////////////////////
+# /////////////////////////////////////////////////////////////
 # 3- loading du modèle pré-entrainé
-# //////////////////////////////////
+# /////////////////////////////////////////////////////////////
 
 """
 Sur le O :
@@ -241,22 +168,37 @@ model = StableDiffusionImg2ImgPipeline.from_pretrained(
 
 
 
-# /////////////////////////////////////////////
+# /////////////////////////////////////////////////////////////////////
 # 4- définition de la fonction d'entrainement
-# /////////////////////////////////////////////
+# ////////////////////////////////////////////////////////////////////
 
-output_dir = Path("./LoRA_results")
+output_dir = Path("./LoRA_results_regression_space")
 os.makedirs(output_dir, exist_ok=True)
 
 
-def train_lora (model, train_loader, val_loader, lora_config,
+def train_lora_regression (model, train_loader, val_loader, lora_config,
                 epochs=100, lr=1e-5,
                 device=DEVICE, patience=5):
+    """
+    _Summary_: fonction pour generer des predictions avec LoRA
+    _Args_: 
+        - model : modèle pré-entrainé
+        - train_loader : dataloader d'entrainement
+        - val_loader : dataloader de validation
+        - lora_config : configuration de LoRA
+        - epochs : nombre d'epochs d'entrainement
+        - lr : learning rate
+    _Returns_:
+        - train_loss_list : liste des pertes d'entrainement
+        - val_loss_list : liste des pertes de validation
+        - best_val_loss : perte de validation la plus basse
+    
+    """
     # integration des adaptaters LoRA dans l'UNet
     model.unet = get_peft_model(model.unet, lora_config)
     optimizer = torch.optim.Adam(model.unet.parameters(), lr=lr)
-    train_loss_list = []
-    val_loss_list = []
+    mae_loss = torch.nn.L1Loss()
+    train_loss_list, val_loss_list = [], []
     best_val_loss = float('inf')
     counter = 0
     # boucle d'entrainement
@@ -265,30 +207,23 @@ def train_lora (model, train_loader, val_loader, lora_config,
         model.unet.train()
         for inp, tar, caption in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"): # affichage d'une barre de progression
             inp, tar = inp.to(DEVICE), tar.to(DEVICE) # envoie sur GPU 
-            # encodage en latents
+            # encodage en latents inputs et targets
             with torch.no_grad():
                 latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
-            # ajout du bruit gaussien
-            timestep = torch.randint(
-                low=0, 
-                high=model.scheduler.num_train_timesteps, 
-                size=(latents_input.shape[0],),
-                device = device).long()
-            noise = torch.randn_like(latents_input)
-            noisy_latents_input = model.scheduler.add_noise(latents_input, noise, timestep)
-            # encoding du texte // conditonnement par le texte
-            inputs_text = model.tokenizer(list(caption),
-                                          padding="max_length",
-                                          max_length=model.tokenizer.model_max_length,
-                                          return_tensors="pt")
-            encoder_hidden_states = model.text_encoder(inputs_text.input_ids.to(device))[0]
-            # unet forward pass
-            pred_noise = model.unet(noisy_latents_input, 
-                              timestep, 
-                              encoder_hidden_states).sample 
+                latents_target = model.vae.encode(tar).latent_dist.sample() * 0.18215
+            # création d'un embedding neutre via CLIP
+            inputs_text = model.tokenizer([""],
+                                        padding="max_length",
+                                        max_length=model.tokenizer.model_max_length,
+                                        return_tensors="pt")
+            text_embeddings = model.text_encoder(inputs_text.input_ids.to(device))[0]
+            # génération du latent_pred avec l'UNet sans ajout de bruit
+            latents_pred = model.unet(latents_input, 
+                                      timestep=torch.tensor([0],device=device), 
+                                      encoder_hidden_states=text_embeddings).sample
             # calcul de la perte
-            loss = F.mse_loss(pred_noise, noise) # MSE error : le modèle apprend à débruiter et non à predire la target
-            # backward pass
+            loss = mae_loss(latents_pred, latents_target)
+            # backward pass = retropropagation classique
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -304,23 +239,19 @@ def train_lora (model, train_loader, val_loader, lora_config,
                 inp, tar = inp.to(device), tar.to(device) # envoie sur GPU 
                 # encodage en latents
                 latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
-                # ajout du bruit gaussien
-                timestep = torch.randint(
-                    low=0, 
-                    high=model.scheduler.num_train_timesteps, 
-                    size=(latents_input.shape[0],),
-                    device = device).long()
-                noise = torch.randn_like(latents_input)
-                noisy_latents_input = model.scheduler.add_noise(latents_input, noise, timestep) 
-                inputs_text = model.tokenizer(list(caption),
+                latents_target = model.vae.encode(tar).latent_dist.sample() * 0.18215
+                # encodage d'un texte neutre
+                inputs_text = model.tokenizer([""],
                                               padding="max_length",
                                               max_length=model.tokenizer.model_max_length,
                                               return_tensors="pt")
-                encoder_hidden_states = model.text_encoder(inputs_text.input_ids.to(device))[0]
-                noise_pred = model.unet(noisy_latents_input, 
-                                  timestep, 
-                                  encoder_hidden_states).sample 
-                loss = F.mse_loss(noise_pred, noise)
+                text_embeddings = model.text_encoder(inputs_text.input_ids.to(device))[0]
+                # génération du latent_pred avec l'UNet sans ajout de bruit
+                latents_pred = model.unet(latents_input, 
+                                          timestep=torch.tensor([0],device=device), 
+                                          encoder_hidden_states=text_embeddings
+                                         ).sample
+                loss = mae_loss(latents_pred, latents_target)
                 val_loss += loss.item()
         val_loss /= len(val_loader)
         val_loss_list.append(val_loss)
@@ -339,7 +270,7 @@ def train_lora (model, train_loader, val_loader, lora_config,
                 print(f"Early stopping at epoch {epoch+1}")
                 break
         # affichage des pertes
-        print(f"Epoch {epoch+1} | Train MSE: {train_loss:.6f} | Val MSE: {val_loss:.6f}")
+        print(f"Epoch {epoch+1} | Train MAE: {train_loss:.6f} | Val MAE: {val_loss:.6f}")
     return train_loss_list, val_loss_list, best_val_loss        
 
 
@@ -350,7 +281,7 @@ def train_lora (model, train_loader, val_loader, lora_config,
 
 
 
-def run_experiment(model, train_loader, val_loader, 
+def run_experiment(model, train_dataset, val_dataset, test_dataset,
                    save_dir, 
                    patience=5, epochs=100, lr=1e-5, device=DEVICE):
     os.makedirs(save_dir, exist_ok=True)
@@ -358,15 +289,16 @@ def run_experiment(model, train_loader, val_loader,
     r_values = [4, 8, 16, 32]
     lora_alpha_values = [16, 32, 64]
     dropout_values = [0.0, 0.1, 0.2]
-    BATCH_SIZE = [1, 2, 4]
-    use_prompt = [True, False]
-    configs =  list(product(r_values, lora_alpha_values, dropout_values, BATCH_SIZE))
+    batch_size = [1,2,4,6,8,10]
+    configs =  list(product(r_values, lora_alpha_values, dropout_values, batch_size))
     results = []
     for (r, alpha, dropout, batch_size) in configs:
         print(f"Training with LoRA config: r={r}, alpha={alpha}, dropout={dropout}")
-        exp_name = f"r{r}_alpha{alpha}_dropout{dropout}_batchsize{BATCH_SIZE}"
-        save_dir = output_dir / exp_name
-        os.makedirs(save_dir, exist_ok=True)
+        exp_name = f"r{r}_alpha{alpha}_dropout{dropout}_batchsize{batch_size}"
+        exp_dir = Path(save_dir) / exp_name
+        os.makedirs(exp_dir, exist_ok=True)
+        # création dataloaders
+        train_loader, val_loader, test_loader = make_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=batch_size)
         # Configurer LoRA
         lora_config = LoraConfig(
             r=r,  # nbre de dimensions latentes : plus r est grand, plus    
@@ -380,7 +312,7 @@ def run_experiment(model, train_loader, val_loader,
             model_path, 
             dtype=torch.float16).to(device)
         # lancement de l'entrainement
-        train_loss_list, val_loss_list, best_val_loss = train_lora(model_copy, train_loader, val_loader,
+        train_loss_list, val_loss_list, best_val_loss = train_lora_regression(model_copy, train_loader, val_loader, 
                                                 lora_config=lora_config, 
                                                 epochs=epochs, lr=lr, 
                                                 patience=patience, device=device)
@@ -419,7 +351,7 @@ def run_experiment(model, train_loader, val_loader,
 # //////////////////////////////////////////
 
 if __name__ == "__main__":
-    results = run_experiment(model, train_loader, val_loader, 
+    results = run_experiment(model, train_dataset, val_dataset, test_dataset,
                              output_dir, epochs=100, lr=1e-5, 
                              patience=10, device=DEVICE)
 # tri et sélection du meilleur modèle

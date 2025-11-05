@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 
 
 
+
+
 # 2- loading du modèle pré-entrainé avec LoRA
 
 model_path = Path(
@@ -31,7 +33,7 @@ model = StableDiffusionImg2ImgPipeline.from_pretrained(
 
 # loader l'adaptateur LoRA dans le UNet du modèle
 
-lora_model = Path("./LoRA_results")
+lora_model = Path("./LoRA_results_regression_space")
 model.load_lora_weights(lora_model)
 
 
@@ -40,9 +42,9 @@ print("Modèle chargé avec LoRA dans l'UNet")
 
 # 3- Loading du dataset de test et d'une image d'entrée
 
-from Stable_diffusion.stable_main_LoRA import test_loader
+from Stable_diffusion.stable_main_LoRA_gridsearch import test_loader
 # on récupère un batch d'images
-inp, tar = next(iter(test_loader))
+inp, tar, caption = next(iter(test_loader))
 print(f"Input batch shape: {inp.shape}, Inout type: {inp.dtype}")
 # torch.Size([1, 3, 512, 512]) torch.float32 [0,1]
 # np.min(inp.numpy()), np.max(inp.numpy()) # (0.0, 1.0)
@@ -65,7 +67,7 @@ print(f"Sample image PIL size: {sample_image_pil.size}, mode: {sample_image_pil.
 # Sample image PIL size: (512, 512), mode: RGB
 
 # génération de la prediction
-prompt = "scientific visualization of 2D velocity field, next timestep prediction, grayscale simulation" 
+prompt = "" 
 with torch.autocast("cuda"):
     prediction = model(
         prompt=prompt,
