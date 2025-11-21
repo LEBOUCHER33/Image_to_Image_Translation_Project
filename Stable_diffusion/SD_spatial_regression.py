@@ -45,6 +45,7 @@ import random
 from itertools import product
 import matplotlib.pyplot as plt
 import json
+from diffusers.models.attention_processor import LoRAAttnProcessor
 
 DEBUG = False
 
@@ -180,7 +181,7 @@ def train_lora_regression (model, train_loader, val_loader, lora_config,
                 epochs=100, lr=1e-5,
                 device=DEVICE, patience=5):
     """
-    _Summary_: fonction pour generer des predictions avec LoRA
+    _Summary_: Fine-tuning spatial (régression de latents) avec LoRA sur l'UNet d'un modèle Stable Diffusion.
     _Args_: 
         - model : modèle pré-entrainé
         - train_loader : dataloader d'entrainement
@@ -195,83 +196,111 @@ def train_lora_regression (model, train_loader, val_loader, lora_config,
     
     """
     # integration des adaptaters LoRA dans l'UNet
-    model.unet = get_peft_model(model.unet, lora_config)
+    unet=model.unet
+    peft_unet = get_peft_model(unet, lora_config)
+    model.unet=peft_unet
+    model.unet.to(torch.float32).to(device)
     optimizer = torch.optim.Adam(model.unet.parameters(), lr=lr)
     mae_loss = torch.nn.L1Loss()
-    train_loss_list, val_loss_list = [], []
     best_val_loss = float('inf')
     counter = 0
     # boucle d'entrainement
+    train_hist, val_hist = [], []
     for epoch in range(epochs):
-        train_loss = 0.0
+        running_loss = 0.0
         model.unet.train()
+        n_batches = 0
         for inp, tar, caption in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"): # affichage d'une barre de progression
-            inp, tar = inp.to(DEVICE), tar.to(DEVICE) # envoie sur GPU 
+            inp = inp.to(device=device, dtype=torch.float32)
+            tar = tar.to(device=device, dtype=torch.float32)
             # encodage en latents inputs et targets
             with torch.no_grad():
-                latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
-                latents_target = model.vae.encode(tar).latent_dist.sample() * 0.18215
-            # création d'un embedding neutre via CLIP
-            inputs_text = model.tokenizer([""],
-                                        padding="max_length",
-                                        max_length=model.tokenizer.model_max_length,
-                                        return_tensors="pt")
-            text_embeddings = model.text_encoder(inputs_text.input_ids.to(device))[0]
+                # forward UNet : on donne un lat_inp et on predit un lat_pred
+                # pipeline.vae expects inputs in [-1,1] float16 on device
+                # timestep = 0 (no diffusion noise) -> treat UNet as mapping lat_in -> lat_pred
+                inp_vae = inp.to(dtype=torch.float16)
+                tar_vae = tar.to(dtype=torch.float16)
+                latents_input = model.vae.encode(inp_vae).latent_dist.sample().to(dtype=torch.float32) * 0.18215 # tensor [1,4,64,64]
+                latents_target = model.vae.encode(tar_vae).latent_dist.sample().to(dtype=torch.float32) * 0.18215
+            timestep_zero = torch.zeros(latents_input.shape[0], dtype=torch.long, device=device)
+            # Optionally use text conditioning if caption(s) provided (here we keep it optional)
+            encoder_hidden_states = None
+            if caption is not None:
+                # captions is a tuple/list of strings for the batch
+                captions_list = [c if isinstance(c, str) else "" for c in caption]
+                if any([len(c.strip())>0 for c in captions_list]):
+                    encoding = model.tokenizer(captions_list, padding="max_length",
+                                                  max_length=model.tokenizer.model_max_length,
+                                                  truncation=True, return_tensors="pt")
+                    input_ids = encoding.input_ids.to(device)
+                    # text_encoder expects float16 typically — cast to its dtype and device
+                    encoder_hidden_states = model.text_encoder(input_ids)[0]
+                    encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=torch.float32)
             # génération du latent_pred avec l'UNet sans ajout de bruit
             latents_pred = model.unet(latents_input, 
-                                      timestep=torch.tensor([0],device=device), 
-                                      encoder_hidden_states=text_embeddings).sample
+                                      timestep=timestep_zero, 
+                                      encoder_hidden_states=encoder_hidden_states).sample
             # calcul de la perte
             loss = mae_loss(latents_pred, latents_target)
             # backward pass = retropropagation classique
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-        train_loss /= len(train_loader)
-        train_loss_list.append(train_loss)
+            running_loss += loss.item()
+            n_batches +=1
+        train_epoch_loss = running_loss / max(1, n_batches)
+        train_hist.append(train_epoch_loss)
         # validation
         # on évalue la perte sur le dataset de validation
         model.unet.eval()
-        val_loss = 0.0
+        val_running = 0.0
+        val_batches = 0
         with torch.no_grad():
             for inp, tar, caption in val_loader:
-                inp, tar = inp.to(device), tar.to(device) # envoie sur GPU 
+                inp = inp.to(device=device, dtype=torch.float32)
+                tar = tar.to(device=device, dtype=torch.float32)# envoie sur GPU 
                 # encodage en latents
-                latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
-                latents_target = model.vae.encode(tar).latent_dist.sample() * 0.18215
-                # encodage d'un texte neutre
-                inputs_text = model.tokenizer([""],
-                                              padding="max_length",
-                                              max_length=model.tokenizer.model_max_length,
-                                              return_tensors="pt")
-                text_embeddings = model.text_encoder(inputs_text.input_ids.to(device))[0]
+                inp_vae = inp.to(dtype=torch.float16)
+                tar_vae = tar.to(dtype=torch.float16)
+                lat_in = model.vae.encode(inp_vae).latent_dist.sample().to(dtype=torch.float32) * 0.18215
+                lat_tar = model.vae.encode(tar_vae).latent_dist.sample().to(dtype=torch.float32) * 0.18215
+                ttimestep_zero = torch.zeros(lat_in.shape[0], dtype=torch.long, device=device)
+                encoder_hidden_states = None
+                if caption is not None:
+                    captions_list = [c if isinstance(c, str) else "" for c in caption]
+                    if any([len(c.strip())>0 for c in captions_list]):
+                        encoding = model.tokenizer(captions_list, padding="max_length",
+                                                      max_length=model.tokenizer.model_max_length,
+                                                      truncation=True, return_tensors="pt")
+                        input_ids = encoding.input_ids.to(device)
+                        encoder_hidden_states = model.text_encoder(input_ids)[0]
+                    encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=torch.float32)
+
                 # génération du latent_pred avec l'UNet sans ajout de bruit
-                latents_pred = model.unet(latents_input, 
-                                          timestep=torch.tensor([0],device=device), 
-                                          encoder_hidden_states=text_embeddings
-                                         ).sample
-                loss = mae_loss(latents_pred, latents_target)
-                val_loss += loss.item()
-        val_loss /= len(val_loader)
-        val_loss_list.append(val_loss)
-        # early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+                lat_pred = model.unet(lat_in, timestep=timestep_zero, encoder_hidden_states=encoder_hidden_states).sample
+                loss = mae_loss(lat_pred, lat_tar)
+                val_running += loss.item()
+                val_batches += 1
+        val_epoch_loss = val_running / max(1, val_batches)
+        val_hist.append(val_epoch_loss)
+        # save best
+        if val_epoch_loss < best_val_loss:
+            best_val_loss = val_epoch_loss
             counter = 0
-            # sauvegarde du meilleur modèle
-            model.unet.save_pretrained(output_dir)
-            model.save_pretrained(output_dir)
-            with open(os.path.join(output_dir, "best_lora_config.txt"), "w") as f:
-                f.write(str(lora_config))
+            # sauvegarder seulement la partie LoRA (peft)
+            # peft models support save_pretrained
+            try:
+                model.unet.save_pretrained(output_dir)
+            except Exception as e:
+                print("Warning: cannot save peft unet with save_pretrained():", e)
         else:
             counter += 1
             if counter >= patience:
                 print(f"Early stopping at epoch {epoch+1}")
                 break
-        # affichage des pertes
-        print(f"Epoch {epoch+1} | Train MAE: {train_loss:.6f} | Val MAE: {val_loss:.6f}")
-    return train_loss_list, val_loss_list, best_val_loss        
+        print(f"Epoch {epoch+1} | Train MAE: {train_epoch_loss:.6f} | Val MAE: {val_epoch_loss:.6f}")
+    return train_hist, val_hist, best_val_loss
+    
 
 
 
@@ -286,17 +315,20 @@ def run_experiment(model, train_dataset, val_dataset, test_dataset,
                    patience=5, epochs=100, lr=1e-5, device=DEVICE):
     os.makedirs(save_dir, exist_ok=True)
     # grille des configs LoRA
-    r_values = [4, 8, 16, 32]
-    lora_alpha_values = [16, 32, 64]
-    dropout_values = [0.0, 0.1, 0.2]
-    batch_size = [1,2,4,6,8,10]
-    configs =  list(product(r_values, lora_alpha_values, dropout_values, batch_size))
+    r_values = [4, 8, 16]
+    lora_alpha_values = [16, 32]
+    dropout_values = [0.0, 0.1]
+    batch_size = [1,2,4]
+    epochs = [50,80]
+    lr_values = [5e-4, 2e-5, 1e-5]
+    configs =  list(product(r_values, lora_alpha_values, dropout_values, batch_size, epochs, lr_values))
     results = []
-    for (r, alpha, dropout, batch_size) in configs:
-        print(f"Training with LoRA config: r={r}, alpha={alpha}, dropout={dropout}")
-        exp_name = f"r{r}_alpha{alpha}_dropout{dropout}_batchsize{batch_size}"
+    for (r, alpha, dropout, batch_size, epochs, lr_val) in configs:
+        print(f"Training with LoRA config: r={r}, alpha={alpha}, dropout={dropout}, batch_size={batch_size}, epochs={epochs}, lr={lr_values}")
+        exp_name = f"r{r}_alpha{alpha}_dropout{dropout}_batchsize{batch_size}_epochs{epochs}"
         exp_dir = Path(save_dir) / exp_name
         os.makedirs(exp_dir, exist_ok=True)
+        print("running experiment")
         # création dataloaders
         train_loader, val_loader, test_loader = make_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=batch_size)
         # Configurer LoRA
@@ -308,36 +340,38 @@ def run_experiment(model, train_dataset, val_dataset, test_dataset,
             bias="none"
         )
         # clone du modèle pour chaque config
-        model_copy = StableDiffusionImg2ImgPipeline.from_pretrained(
-            model_path, 
-            dtype=torch.float16).to(device)
+        # re-load fresh pipeline for each experiment to reset weights
+        pipe_copy = StableDiffusionImg2ImgPipeline.from_pretrained(model_path, torch_dtype=torch.float16).to(device)
+        # ensure unet in float32 for training
+        pipe_copy.unet = pipe_copy.unet.to(torch.float32).to(device)
         # lancement de l'entrainement
-        train_loss_list, val_loss_list, best_val_loss = train_lora_regression(model_copy, train_loader, val_loader, 
+        train_hist, val_hist, best_val_loss = train_lora_regression(pipe_copy, train_loader, val_loader, 
                                                 lora_config=lora_config, 
-                                                epochs=epochs, lr=lr, 
+                                                epochs=epochs, lr=lr_val, 
                                                 patience=patience, device=device)
         # enregistrement des resultas
         results.append({
             "config": exp_name,
             "best_val_loss": best_val_loss,
-            "val_loss_history": val_loss_list,
-            "train_loss_history": train_loss_list
+            "val_loss_history": val_hist,
+            "train_loss_history": train_hist
         })
         # sauvegarde de la liste des pertes
-        with open(os.path.join(save_dir, "val_loss_history.csv"), "w", newline="") as f:
+        # save CSVs inside exp_dir
+        with open(exp_dir / "val_loss_history.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "loss"])
-            for i, loss in enumerate(val_loss_list, 1):
-                writer.writerow([i, loss])
-        with open(os.path.join(save_dir, "train_loss_history.csv"), "w", newline="") as f:
+            writer.writerow(["epoch", "val_loss"])
+            for i, l in enumerate(val_hist, 1):
+                writer.writerow([i, l])
+        with open(exp_dir / "train_loss_history.csv", "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "loss"])
-            for i, loss in enumerate(train_loss_list, 1):
-                writer.writerow([i, loss])
+            writer.writerow(["epoch", "train_loss"])
+            for i, l in enumerate(train_hist, 1):
+                writer.writerow([i, l])
         # sauvegarde de la courbe des pertes
         plt.figure()
-        plt.plot(val_loss_list, label="Validation loss", color="red", linewidth=2, linestyle="--")
-        plt.plot(train_loss_list, label="Training loss", color="blue", linewidth=2, linestyle="-")
+        plt.plot(val_hist, label="Validation loss", color="red", linewidth=2, linestyle="--")
+        plt.plot(train_hist, label="Training loss", color="blue", linewidth=2, linestyle="-")
         plt.xlabel("Epoch") 
         plt.ylabel("MSE Loss")
         plt.legend()
@@ -352,11 +386,10 @@ def run_experiment(model, train_dataset, val_dataset, test_dataset,
 
 if __name__ == "__main__":
     results = run_experiment(model, train_dataset, val_dataset, test_dataset,
-                             output_dir, epochs=100, lr=1e-5, 
-                             patience=10, device=DEVICE)
+                             output_dir, lr=1e-4, 
+                             patience=3, device=DEVICE)
+    print("All experiments done")
 # tri et sélection du meilleur modèle
-    best = sorted(results, key=lambda x: x["best_val_loss"])[0] # tri par meilleure perte de validation
-    print(f"Best LoRA config: {best['config']} with Val MSE: {best['best_val_loss']:.6f}")
-    best_lora_dir = output_dir / best['config']
-    with open(os.path.join(best_lora_dir, "best_lora_config.txt"), "w") as f:
-        f.write(str(best_lora_dir))
+    # trier les résultats
+    best = sorted(results, key=lambda x: x["best_val_loss"])[0]
+    print("Best LoRA config:", best["config"], "val_loss:", best["best_val_loss"])

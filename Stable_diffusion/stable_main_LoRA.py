@@ -35,11 +35,6 @@ from torchvision import transforms
 import csv
 from sklearn.model_selection import train_test_split
 import random
-from itertools import product
-import copy
-import matplotlib.pyplot as plt
-import json
-from stable_dataset import generate_dataset
 
 DEBUG = False
 
@@ -47,16 +42,6 @@ DEBUG = False
 # check l'accès aux GPUs
 torch.cuda.is_available()
 
-#/////////////////////////////////////
-# 2- création du dataset
-#/////////////////////////////////////
-
-metadata_path = generate_dataset(
-    dataset_path=Path("./git/ImageMLProject/Datasets/CFD_Dataset/film_3_512x512.npy"),
-    data_dir="./git/ImageMLProject/Stable_diffusion/dataset_velocity",
-    use_prompt=True,
-    resize_shape=(512,512)
-)
 
 
 # ////////////////////////////////////
@@ -72,7 +57,8 @@ Objectif :
 5- création des dataloaders nécessaires pour LoRA
 
 """
-"""
+
+DATA_DIR = Path("./git/ImageMLProject/Stable_diffusion/dataset_velocity")
 
 input_dir = os.path.join(DATA_DIR, "input")
 target_dir = os.path.join(DATA_DIR, "target")
@@ -91,27 +77,21 @@ print(f"Train: {len(train_files)} | Val: {len(val_files)} | Test: {len(test_file
 
 output_dir = Path("./LoRA_results")
 os.makedirs(output_dir, exist_ok=True)
-"""
 
 
 class VelocityDataset (Dataset):
-    def __init__(self, data_dir, metadata_path=None):
-        self.data_dir = data_dir
+    def __init__(self, data_dir, file_list=None):
         self.input_dir = os.path.join(data_dir, "input")
         self.target_dir = os.path.join(data_dir, "target")
-        if metadata_path is None:
-            metadata_path = os.path.join(data_dir, "metadata.jsonl")
-        with open(metadata_path, "r") as f:
-            self.metadata = [json.loads(line) for line in f]
+        self.files = file_list
     
     def __len__(self):
-        return len(self.metadata)
+        return len(self.files)
     
     def __getitem__(self, idx):
-        sample = self.metadata[idx]
-        input_path = os.path.join(self.data_dir, sample["input"])
-        target_path = os.path.join(self.data_dir, sample["target"])
-        caption = sample.get("caption", "")
+        fnames = self.files[idx]
+        input_path = os.path.join(self.input_dir, fnames)
+        target_path = os.path.join(self.target_dir, fnames)
         # chargement des images .png : loader d'images
         input_image = Image.open(input_path).convert("RGB") # PIL.image (512,512) [0,255]
         target_image = Image.open(target_path).convert("RGB") 
@@ -123,8 +103,7 @@ class VelocityDataset (Dataset):
         tar_tensor = torch.from_numpy(target_arr)
         inp_tensor = inp_tensor.permute(2, 0, 1).float() / 255.0 # torch.tensor [3,512,512] [0,1]
         tar_tensor = tar_tensor.permute(2, 0, 1).float() / 255.0 
-        return inp_tensor, tar_tensor, caption
-
+        return inp_tensor, tar_tensor
 
 """
 possiblité d'utiliser torchvision.transforms :
@@ -143,51 +122,17 @@ inp = transform(Image.open(inp_path).convert("RGB"))
 tgt = transform(Image.open(tgt_path).convert("RGB"))
 
 """
-
-
-
 BATCH_SIZE = 1
-DATA_DIR = os.path.join("./git/ImageMLProject/Stable_diffusion/dataset_velocity")
-
-
-
-# récupération des données
-with open(metadata_path, "r") as f:
-    metadata = [json.loads(line) for line in f]
-
-# shuffle des couples
-random.seed(42)
-random.shuffle(metadata)
-
-# split du dataset en train/val/test
-train_files, tmp_files = train_test_split(metadata, test_size=0.2, random_state=42)
-val_files, test_files = train_test_split(tmp_files, test_size=0.5, random_state=42)
-
-# sauvegarde des datasets
-def save_jsonl(meta_list, save_path):
-    with open(save_path, "w") as f:
-        for entry in meta_list:
-            f.write(json.dumps(entry))
-            f.write("\n")
-
-save_jsonl(train_files, os.path.join(DATA_DIR, "train_metadata.jsonl"))
-save_jsonl(val_files, os.path.join(DATA_DIR, "val_metadata.jsonl"))
-save_jsonl(test_files, os.path.join(DATA_DIR, "test_metadata.jsonl"))
-
 
 # loading des datasets
-train_dataset = VelocityDataset(DATA_DIR, metadata_path=os.path.join(DATA_DIR, "train_metadata.jsonl"))
-val_dataset = VelocityDataset(DATA_DIR, metadata_path=os.path.join(DATA_DIR, "val_metadata.jsonl"))
-test_dataset = VelocityDataset(DATA_DIR, metadata_path=os.path.join(DATA_DIR, "test_metadata.jsonl"))
+train_dataset = VelocityDataset(DATA_DIR, train_files)
+val_dataset = VelocityDataset(DATA_DIR, val_files)
+test_dataset = VelocityDataset(DATA_DIR, test_files)
 
 if DEBUG :
-    for i in range(5):  # les 5 premiers éléments
-        inp, tar, caption = train_dataset[i]
-        print(f"Sample {i}:")
-        print(f"  Input tensor shape : {inp.shape}, dtype={inp.dtype}, min={np.min(inp.numpy())}, max={np.max(inp.numpy())}")
-        print(f"  Target tensor shape: {tar.shape}, dtype={tar.dtype}")
-        # torch.Tensor float32 [3,512,512] [0,1]
-        print(f"  Caption  : '{caption}'")
+    inp, tar = train_dataset[0]
+    print(inp.shape, tar.shape, inp.dtype, tar.dtype) # torch.Tensor float32 [3,512,512]
+    print(np.min(inp.numpy()), np.max(inp.numpy())) # [0,1]
 
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True) # torch.Tensor float32 [1,3,512,512]
@@ -196,9 +141,9 @@ test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
 if DEBUG:
-    inp, tar, caption = next(iter(train_loader))
-    print(inp.shape, inp.dtype, type(inp), np.min(inp.numpy()), np.max(inp.numpy()), f"caption : {caption}")
-    # torch.Tensor float32 [1,3,512,512] [0,1]
+    inp, tar = next(iter(train_loader))
+    print(inp.shape, tar.shape, inp.dtype, tar.dtype, type(inp), type(tar))
+    # torch.Tensor float32 [1,3,512,512]
     import matplotlib.pyplot as plt
     plt.subplot(1, 2, 1)
     plt.imshow(inp[0].permute(1, 2, 0).cpu())  # tensor -> HWC
@@ -234,197 +179,157 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 model_path = Path(
     "./git/ImageMLProject/Stable_diffusion/SD1-5_local"
 )
-
+# charger le modèle avec diffusers et la méthode adaptée pour Image_to_Image
 model = StableDiffusionImg2ImgPipeline.from_pretrained(
     model_path, 
     dtype=torch.float16).to(DEVICE)
 
+# récupération de l'unet du modèle
+unet = model.unet
 
 
-# /////////////////////////////////////////////
-# 4- définition de la fonction d'entrainement
-# /////////////////////////////////////////////
 
-output_dir = Path("./LoRA_results")
-os.makedirs(output_dir, exist_ok=True)
+# /////////////////////////
+# 4- configuration de LoRA
+# /////////////////////////
 
 
-def train_lora (model, train_loader, val_loader, lora_config,
-                epochs=100, lr=1e-5,
-                device=DEVICE, patience=5):
-    # integration des adaptaters LoRA dans l'UNet
-    model.unet = get_peft_model(model.unet, lora_config)
-    optimizer = torch.optim.Adam(model.unet.parameters(), lr=lr)
-    train_loss_list = []
-    val_loss_list = []
-    best_val_loss = float('inf')
-    counter = 0
-    # boucle d'entrainement
-    for epoch in range(epochs):
-        train_loss = 0.0
-        model.unet.train()
-        for inp, tar, caption in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"): # affichage d'une barre de progression
-            inp, tar = inp.to(DEVICE), tar.to(DEVICE) # envoie sur GPU 
-            # encodage en latents
-            with torch.no_grad():
-                latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
-            # ajout du bruit gaussien
-            timestep = torch.randint(
-                low=0, 
-                high=model.scheduler.num_train_timesteps, 
-                size=(latents_input.shape[0],),
-                device = device).long()
-            noise = torch.randn_like(latents_input)
-            noisy_latents_input = model.scheduler.add_noise(latents_input, noise, timestep)
-            # encoding du texte // conditonnement par le texte
-            inputs_text = model.tokenizer(list(caption),
-                                          padding="max_length",
-                                          max_length=model.tokenizer.model_max_length,
-                                          return_tensors="pt")
-            encoder_hidden_states = model.text_encoder(inputs_text.input_ids.to(device))[0]
-            # unet forward pass
-            pred_noise = model.unet(noisy_latents_input, 
-                              timestep, 
-                              encoder_hidden_states).sample 
-            # calcul de la perte
-            loss = F.mse_loss(pred_noise, noise) # MSE error : le modèle apprend à débruiter et non à predire la target
-            # backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-        train_loss /= len(train_loader)
-        train_loss_list.append(train_loss)
-        # validation
-        # on évalue la perte sur le dataset de validation
-        model.unet.eval()
-        val_loss = 0.0
+# Configurer LoRA
+config = LoraConfig(
+    r=8,  # nbre de dimensions latentes : plus r est grand, plus l'adaptation est flexible mais plus il y a de paramètres à entraîner'
+    lora_alpha=32,
+    target_modules=["to_q", "to_v"],  # couches attention du UNet
+    lora_dropout=0.1,
+    bias="none"
+)
+
+
+
+"""
+# Ajouter une couche LoRA à ton UNet
+model.unet.add_adapter("lora_adapter", rank=8)
+model.unet.enable_adapters()
+"""
+
+
+
+# /////////////////////////////////////////////////
+# 5- configuration des paramètres d'entrainements
+# /////////////////////////////////////////////////
+
+EPOCHS = 100
+LR = 1e-5
+# Optimiseur
+optimizer = torch.optim.Adam(model.unet.parameters(), lr=LR)
+# model
+model.unet = get_peft_model(model.unet, config)
+unet.train()
+
+
+# //////////////////////////////////
+# 6- boucle d'entrainement
+# //////////////////////////////////
+
+
+
+# Boucle d'entrainement
+"""
+Objectif : on va seulement entrainer l'unet
+on garde figer le VAE et le CLIP (encoder image et text)
+
+NB : l'unet prend en entrée 
+- un latent bruité = sample // format des latents = [B,C,H/8,W/8]
+- un timestep (étape de diffusion du bruit)
+- des embeddings de texte pour conditionner la prediction
+
+=> il faut construire un pipeline de formatage des inputs :
+    - loader les batches
+    - convertir les tensors en latents
+    - ajouter du bruit
+    - préparer les embeddings de texte
+
+dans l'entrainement :
+    - faire une prediction bruitée
+    - calculer la loss
+    - backward + optimizer step
+
+"""
+
+if DEBUG:
+    inp, tar = next(iter(train_loader)) # tensor [1,3,512,512]
+    inp = inp.to(DEVICE) 
+    tar = tar.to(DEVICE)
+    # conversion en latents
+    latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
+    latents_target = model.vae.encode(tar).latent_dist.sample() * 0.18215
+    # ajout du bruit gaussien à différentes timesteps selon un schedule
+    timestep = torch.randint(0, model.scheduler.num_train_timesteps, (latents_input.shape[0],), device = DEVICE).long()
+    noise = torch.randn_like(latents_input)
+    noisy_latents_input = model.scheduler.add_noise(latents_input, noise, timestep)
+    # préparation de l'encoding du texte
+    prompt = ["scientific visualization of 2D velocity field, next timestep prediction, grayscale simulation"]*BATCH_SIZE
+    input_ids = model.tokenizer(prompt, padding="max_length", max_length=model.tokenizer.model_max_length, return_tensors="pt")
+    encoder_hidden_states = model.text_encoder(input_ids.input_ids.to(DEVICE))[0]
+    # forward pass
+    pred = model.unet(noisy_latents_input, timestep, encoder_hidden_states).sample
+    # calcul de la perte
+    loss = F.l1_loss(pred, latents_target)
+    print(loss)
+    
+
+losses_list = []
+for epoch in range(EPOCHS):
+    epoch_loss = 0.0
+    unet.train()
+    for inp, tar in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"): # affichage d'une barre de progression
+        inp, tar = inp.to(DEVICE), tar.to(DEVICE) # envoie sur GPU 
+        # encodage en latents
         with torch.no_grad():
-            for inp, tar, caption in val_loader:
-                inp, tar = inp.to(device), tar.to(device) # envoie sur GPU 
-                # encodage en latents
-                latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
-                # ajout du bruit gaussien
-                timestep = torch.randint(
-                    low=0, 
-                    high=model.scheduler.num_train_timesteps, 
-                    size=(latents_input.shape[0],),
-                    device = device).long()
-                noise = torch.randn_like(latents_input)
-                noisy_latents_input = model.scheduler.add_noise(latents_input, noise, timestep) 
-                inputs_text = model.tokenizer(list(caption),
-                                              padding="max_length",
-                                              max_length=model.tokenizer.model_max_length,
-                                              return_tensors="pt")
-                encoder_hidden_states = model.text_encoder(inputs_text.input_ids.to(device))[0]
-                noise_pred = model.unet(noisy_latents_input, 
-                                  timestep, 
-                                  encoder_hidden_states).sample 
-                loss = F.mse_loss(noise_pred, noise)
-                val_loss += loss.item()
-        val_loss /= len(val_loader)
-        val_loss_list.append(val_loss)
-        # early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            counter = 0
-            # sauvegarde du meilleur modèle
-            model.unet.save_pretrained(output_dir)
-            model.save_pretrained(output_dir)
-            with open(os.path.join(output_dir, "best_lora_config.txt"), "w") as f:
-                f.write(str(lora_config))
-        else:
-            counter += 1
-            if counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-        # affichage des pertes
-        print(f"Epoch {epoch+1} | Train MSE: {train_loss:.6f} | Val MSE: {val_loss:.6f}")
-    return train_loss_list, val_loss_list, best_val_loss        
+            latents_input = model.vae.encode(inp).latent_dist.sample() * 0.18215 # tensor [1,4,64,64]
+            latents_target = model.vae.encode(tar).latent_dist.sample() * 0.18215
+        # ajout du bruit gaussien
+        timestep = torch.randint(
+            low=0, 
+            high=model.scheduler.num_train_timesteps, 
+            size=(latents_input.shape[0],),
+            device = DEVICE).long()
+        noise = torch.randn_like(latents_input)
+        noisy_latents_input = model.scheduler.add_noise(latents_input, noise, timestep)
+        # encoding du texte // conditonnement par le texte
+        prompt = ["scientific visualization of 2D velocity field, next timestep prediction, grayscale simulation"] * BATCH_SIZE
+        inputs = model.tokenizer(prompt, padding="max_length", max_length=model.tokenizer.model_max_length, return_tensors="pt")
+        encoder_hidden_states = model.text_encoder(inputs.input_ids.to(DEVICE))[0]
+        # unet forward pass
+        pred_noise = unet(noisy_latents_input, 
+                          timestep, 
+                          encoder_hidden_states).sample 
+        # calcul de la perte
+        loss = F.mse_loss(pred_noise, noise) # MSE error : le modèle apprend à débruiter et non à predire la target
+        # backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+    losses_list.append(epoch_loss / len(train_loader))
+    print(f"Epoch {epoch+1} - Loss: {epoch_loss / len(train_loader):.6f}")
 
 
 
-# //////////////////////////////////////////////////
-# 5- définition de la fonction de Grid Search LoRA
-# //////////////////////////////////////////////////
+
+
+# sauvegarde de la liste des pertes 
+with open("loss_history.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["epoch", "loss"])
+    for i, loss in enumerate(losses_list, 1):
+        writer.writerow([i, loss])
 
 
 
-def run_experiment(model, train_loader, val_loader, 
-                   save_dir, 
-                   patience=5, epochs=100, lr=1e-5, device=DEVICE):
-    os.makedirs(save_dir, exist_ok=True)
-    # grille des configs LoRA
-    r_values = [4, 8, 16, 32]
-    lora_alpha_values = [16, 32, 64]
-    dropout_values = [0.0, 0.1, 0.2]
-    BATCH_SIZE = [1, 2, 4]
-    use_prompt = [True, False]
-    configs =  list(product(r_values, lora_alpha_values, dropout_values, BATCH_SIZE))
-    results = []
-    for (r, alpha, dropout, batch_size) in configs:
-        print(f"Training with LoRA config: r={r}, alpha={alpha}, dropout={dropout}")
-        exp_name = f"r{r}_alpha{alpha}_dropout{dropout}_batchsize{BATCH_SIZE}"
-        save_dir = output_dir / exp_name
-        os.makedirs(save_dir, exist_ok=True)
-        # Configurer LoRA
-        lora_config = LoraConfig(
-            r=r,  # nbre de dimensions latentes : plus r est grand, plus    
-            lora_alpha=alpha,
-            target_modules=["to_q", "to_v"],  # couches attention du UNet
-            lora_dropout=dropout,   
-            bias="none"
-        )
-        # clone du modèle pour chaque config
-        model_copy = StableDiffusionImg2ImgPipeline.from_pretrained(
-            model_path, 
-            dtype=torch.float16).to(device)
-        # lancement de l'entrainement
-        train_loss_list, val_loss_list, best_val_loss = train_lora(model_copy, train_loader, val_loader,
-                                                lora_config=lora_config, 
-                                                epochs=epochs, lr=lr, 
-                                                patience=patience, device=device)
-        # enregistrement des resultas
-        results.append({
-            "config": exp_name,
-            "best_val_loss": best_val_loss,
-            "val_loss_history": val_loss_list,
-            "train_loss_history": train_loss_list
-        })
-        # sauvegarde de la liste des pertes
-        with open(os.path.join(save_dir, "val_loss_history.csv"), "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "loss"])
-            for i, loss in enumerate(val_loss_list, 1):
-                writer.writerow([i, loss])
-        with open(os.path.join(save_dir, "train_loss_history.csv"), "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "loss"])
-            for i, loss in enumerate(train_loss_list, 1):
-                writer.writerow([i, loss])
-        # sauvegarde de la courbe des pertes
-        plt.figure()
-        plt.plot(val_loss_list, label="Validation loss", color="red", linewidth=2, linestyle="--")
-        plt.plot(train_loss_list, label="Training loss", color="blue", linewidth=2, linestyle="-")
-        plt.xlabel("Epoch") 
-        plt.ylabel("MSE Loss")
-        plt.legend()
-        plt.savefig(os.path.join(save_dir, "losses_curve.png"))
-        plt.close()
-    return results
 
+# ///////////////////
+# Sauvegarde du modèle
+# //////////////////
 
-# //////////////////////////////////////////
-# 6- entrainement avec grid search LoRA
-# //////////////////////////////////////////
-
-if __name__ == "__main__":
-    results = run_experiment(model, train_loader, val_loader, 
-                             output_dir, epochs=100, lr=1e-5, 
-                             patience=10, device=DEVICE)
-# tri et sélection du meilleur modèle
-    best = sorted(results, key=lambda x: x["best_val_loss"])[0] # tri par meilleure perte de validation
-    print(f"Best LoRA config: {best['config']} with Val MSE: {best['best_val_loss']:.6f}")
-    best_lora_dir = output_dir / best['config']
-    with open(os.path.join(best_lora_dir, "best_lora_config.txt"), "w") as f:
-        f.write(str(best_lora_dir))
+model.unet.save_pretrained(output_dir)
+model.save_pretrained(output_dir)
